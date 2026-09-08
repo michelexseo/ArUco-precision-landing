@@ -31,14 +31,14 @@ def detect(args):
         if not ret or frame is None:
             break
         frame = vs.read()[1]
-        print("[DEBG]: detecting ArUCo markers in the frame...")
+        # print("[DEBG]: detecting ArUCo markers in the frame...")
         # detect ArUCo markers in the input frame
         # corners is a list of corners  for each detected marker, ids is the list of ids for each detected marker, and rejected is a list of rejected candidates
         (corners, ids, rejected) = detector.detectMarkers(frame)
 
         if (ids is not None and len(corners) > 0):
-            print("[DEBUG]: detected {} ArUCo markers in the frame.".format(len(ids)))
-            print("[DEBUG]: ArUco maerker corners: {}".format(corners))
+            # print("[DEBUG]: detected {} ArUCo markers in the frame.".format(len(ids)))
+            # print("[DEBUG]: ArUco maerker corners: {}".format(corners))
             # flatten the ArUCo IDs list and draw the bounding box of the ArUCo detections
             ids = ids.flatten()
 
