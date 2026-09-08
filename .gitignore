@@ -354,6 +354,10 @@ paket-files/
 **/__pycache__/
 *.pyc
 
+# Python virtual environments and local machine files
+venv/
+.DS_Store
+
 # Cake - Uncomment if you are using it
 #tools/**
 #!tools/packages.config
