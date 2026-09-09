@@ -123,9 +123,9 @@ if __name__ == "__main__":
 
     args = vars(ap.parse_args())
 
-    if sys.argv[1:] == []:
-        print("[ERROR] No arguments provided. Please specify the ArUCo tag type and calibration parameters file.")
-        sys.exit(0)
+    # if sys.argv[1:] == []:
+    #     print("[ERROR] No arguments provided. Please specify the ArUCo tag type and calibration parameters file.")
+    #     sys.exit(0)
 
     if args["type"] not in ARUCO_DICT.keys():
         print(f"[ERROR] ArUCo tag type '{args['type']}' is not supported.")
@@ -141,8 +141,8 @@ if __name__ == "__main__":
     # in the calibration_params.npz file, the camera matrix is stored under the key "camera_matrix" and the distortion coefficients under "dist_coeffs"
     k = calibration_params["camera_matrix"]
     d = calibration_params["dist_coeffs"]
-    print(k)
-    print(d)
+    # print(k)
+    # print(d)
     side_length = args["side_length"]
 
     video = cv2.VideoCapture(0)
@@ -163,6 +163,11 @@ if __name__ == "__main__":
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        if key == 32:  # SPACE
+            # save the frame to disk
+            filename = "pose_estimation" + str(int(time.time())) + ".png"
+            cv2.imwrite(filename, output)
+            print(f"[INFO] saved {filename} to disk.")
     mean = np.mean(dists) if dists else 0
     print(f"Mean distance to detected markers: {mean:.3f} m")
     
