@@ -103,7 +103,7 @@ if __name__ == "__main__":
         "-cp",
         "--calibration_params",
         type=str,
-        default="calibration_params.npz",
+        default="camera_calibration.npz",
         help="path to the calibration parameters file"
     )
 
