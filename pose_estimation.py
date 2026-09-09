@@ -57,7 +57,8 @@ def pose_esitmation(frame, aruco_dict_type, matrix_coefficients, distortion_coef
                 marker_points,
                 image_points,
                 matrix_coefficients,
-                distortion_coefficients
+                distortion_coefficients,
+                cv2.SOLVEPNP_IPPE_SQUARE
             )
 
             if not success:
@@ -86,6 +87,8 @@ def pose_esitmation(frame, aruco_dict_type, matrix_coefficients, distortion_coef
             print(f"Rotation vector: {rvec.ravel()}")
             distance = np.linalg.norm(tvec)
             print(f"Marker distance: {distance:.3f} m")
+
+           
 
     return frame
 
@@ -127,8 +130,8 @@ if __name__ == "__main__":
     # in the calibration_params.npz file, the camera matrix is stored under the key "camera_matrix" and the distortion coefficients under "dist_coeffs"
     k = calibration_params["camera_matrix"]
     d = calibration_params["dist_coeffs"]
-    print(k)
-    print(d)
+    # print(k)
+    # print(d)
 
     video = cv2.VideoCapture(0)
     video.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
