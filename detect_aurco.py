@@ -5,6 +5,7 @@ import argparse
 import time
 import sys
 from utils import ARUCO_DICT
+from utils import aruco_display
 
 def detect(args):
     # verify that the supplied ArUCo tag exists and is supported by
@@ -42,7 +43,8 @@ def detect(args):
             # flatten the ArUCo IDs list and draw the bounding box of the ArUCo detections
             ids = ids.flatten()
 
-            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+            # cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+            frame = aruco_display(corners, ids, rejected, frame)
 
         cv2.imshow("Frame", frame)
         key = cv2.waitKey(1) & 0xFF
@@ -66,7 +68,7 @@ def detect(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-t", "--type", type=str,
-        default="DICT_ARUCO_ORIGINAL",
+        default="DICT_4X4_1000",
         help="type of ArUCo tag to detect")
     args = vars(ap.parse_args())
 
