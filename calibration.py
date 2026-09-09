@@ -1,10 +1,10 @@
 """
 Script to calibrate a camera using chessboard images. It captures images from a webcam, detects chessboard corners, computes camera intrinsics and distortion coefficients, evaluates reprojection errors, and provides a live undistortion preview.
 Usage:
-    python calibration.py <CAPTURE_IMAGES: true/false>
+    python calibration.py <CAPTURE_IMAGES: true/false> [<OUTPUT_FILE>]
 Arguments:
     <CAPTURE_IMAGES: true/false> - Whether to capture new calibration images from the
-
+    <OUTPUT_FILE> - Optional path to save calibration parameters (default: camera_calibration.npz)
 """
 
 import cv2 as cv
