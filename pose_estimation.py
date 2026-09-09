@@ -16,7 +16,7 @@ import time
 import os
 
 
-def pose_esitmation(frame, aruco_dict_type, matrix_coefficients, distortion_coefficients, side_length=0.05):
+def pose_estimation(frame, aruco_dict_type, matrix_coefficients, distortion_coefficients, side_length=0.05):
 
     '''
     frame - Frame from the video stream
@@ -25,6 +25,7 @@ def pose_esitmation(frame, aruco_dict_type, matrix_coefficients, distortion_coef
 
     return:-
     frame - The frame with the axis drawn on it
+    dists - List of distances from the camera to each detected marker
     '''
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -32,6 +33,7 @@ def pose_esitmation(frame, aruco_dict_type, matrix_coefficients, distortion_coef
     arucoParams = cv2.aruco.DetectorParameters()
     detector = cv2.aruco.ArucoDetector(arucodict, arucoParams)
 
+    dists = []
 
     corners, ids, rejected_img_points = detector.detectMarkers(gray)
     frame = aruco_display(
@@ -87,10 +89,11 @@ def pose_esitmation(frame, aruco_dict_type, matrix_coefficients, distortion_coef
             print(f"Rotation vector: {rvec.ravel()}")
             distance = np.linalg.norm(tvec)
             print(f"Marker distance: {distance:.3f} m")
+            dists.append(distance)
 
            
 
-    return frame
+    return frame, dists
 
 if __name__ == "__main__":
     ap  = argparse.ArgumentParser()
@@ -108,6 +111,14 @@ if __name__ == "__main__":
         type=str,
         default="camera_calibration.npz",
         help="path to the calibration parameters file"
+    )
+
+    ap.add_argument(
+        "-s",
+        "--side_length",
+        type=float,
+        default=0.1,
+        help="side length of the ArUCo marker in meters"
     )
 
     args = vars(ap.parse_args())
@@ -130,8 +141,9 @@ if __name__ == "__main__":
     # in the calibration_params.npz file, the camera matrix is stored under the key "camera_matrix" and the distortion coefficients under "dist_coeffs"
     k = calibration_params["camera_matrix"]
     d = calibration_params["dist_coeffs"]
-    # print(k)
-    # print(d)
+    print(k)
+    print(d)
+    side_length = args["side_length"]
 
     video = cv2.VideoCapture(0)
     video.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -143,14 +155,17 @@ if __name__ == "__main__":
 
         if not ret:
             break
-        side = 0.1 # side length of the ArUco marker in meters
-        output = pose_esitmation(frame, aruco_dict_type, k, d, side_length=side)
+            
+        output, dists = pose_estimation(frame, aruco_dict_type, k, d, side_length)
 
         cv2.imshow('Estimated Pose', output)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+    mean = np.mean(dists) if dists else 0
+    print(f"Mean distance to detected markers: {mean:.3f} m")
+    
 
     video.release()
     cv2.destroyAllWindows()
