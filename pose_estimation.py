@@ -53,14 +53,19 @@ def pose_estimation(frame, aruco_dict_type, matrix_coefficients, distortion_coef
         ], dtype=np.float32)
 
         for i, marker_corners in enumerate(corners):
+            # Reshape the marker corners to a 4x2 array and convert to float32 [[[x1, y1], [x2, y2], [x3, y3], [x4, y4]]]
+            # The marker corners are in the order: top-left, top-right, bottom-right, bottom-left
             image_points = marker_corners.reshape(4, 2).astype(np.float32)
 
+            # Solve for the rotation and translation vectors using solvePnP
+            # rvec - Rotation vector (Rodrigues) that describes the rotation of the marker with respect to the camera
+            # tvec - Translation vector that describes the position of the marker with respect to the camera
             success, rvec, tvec = cv2.solvePnP(
                 marker_points,
                 image_points,
                 matrix_coefficients,
                 distortion_coefficients,
-                cv2.SOLVEPNP_IPPE_SQUARE
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
             )
 
             if not success:
@@ -81,6 +86,7 @@ def pose_estimation(frame, aruco_dict_type, matrix_coefficients, distortion_coef
                 side_length * 0.5,
                 4,
             )
+            # Calculate the origin of the marker in the camera coordinate system
             origin, _ = cv2.projectPoints(np.zeros((1, 3), np.float32), rvec, tvec, k, d)
             print(origin.ravel(), image_points.mean(axis=0))
 
@@ -138,11 +144,13 @@ if __name__ == "__main__":
     calibration_params_path = args["calibration_params"]
 
     calibration_params = np.load(calibration_params_path)
+
     # in the calibration_params.npz file, the camera matrix is stored under the key "camera_matrix" and the distortion coefficients under "dist_coeffs"
     k = calibration_params["camera_matrix"]
     d = calibration_params["dist_coeffs"]
     # print(k)
     # print(d)
+
     side_length = args["side_length"]
 
     video = cv2.VideoCapture(0)
@@ -163,6 +171,7 @@ if __name__ == "__main__":
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        # to save the frame to disk when the spacebar is pressed
         if key == 32:  # SPACE
             # save the frame to disk
             filename = "pose_estimation" + str(int(time.time())) + ".png"
