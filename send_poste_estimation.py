@@ -7,6 +7,8 @@ from pymavlink import mavutil
 from utils import ARUCO_DICT
 import math
 import argparse
+import yaml
+from pathlib import Path
 
 # Downward camera: OpenCV (x right, y down, z optical) -> FRD
 R_CAM_TO_BODY = np.array([
@@ -15,6 +17,10 @@ R_CAM_TO_BODY = np.array([
     [ 0,  0, 1],  # z_frd =  z_cam
 ], dtype=float)
 
+
+def load_config(path: str = "config.yaml") -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
 def latest_message(master, msgtype, cache):
     msg = master.recv_match(type=msgtype, blocking=False)
@@ -63,79 +69,63 @@ def estimate_marker(frame, detector, K, dist, side):
     )
     return tvec if ok else None
 
-
-if __name__ == "__main__":
-    ap  = argparse.ArgumentParser()
-    ap.add_argument(
-        "-t",
-        "--type",
-        type=str,
-        default="DICT_4X4_1000",
-        help="type of ArUCo tag to detect",
-    )
-
-    ap.add_argument(
-        "-cp",
-        "--calibration_params",
-        type=str,
-        default="camera_calibration.npz",
-        help="path to the calibration parameters file"
-    )
-
-    ap.add_argument(
-        "-s",
-        "--side_length",
-        type=float,
-        default=0.1,
-        help="side length of the ArUCo marker in meters"
-    )
-
-    args = vars(ap.parse_args())
-
-    aruco_dict_type = ARUCO_DICT[args["type"]]
-    calibration_params = args["calibration_params"]
-    side_length = args["side_length"]
-    calib = np.load(calibration_params)
-    K, dist = calib["camera_matrix"], calib["dist_coeffs"]
-    detector = cv2.aruco.ArucoDetector(
-        cv2.aruco.getPredefinedDictionary(aruco_dict_type),
-        cv2.aruco.DetectorParameters(),
-    )
-
-    mavutil.set_dialect("common")
-    master = mavutil.mavlink_connection("udpin:0.0.0.0:14540")
+def mavlink_connection(mavlink_connection_string):
+    master = mavutil.mavlink_connection(mavlink_connection_string)
     print("Waiting for heartbeat...")
     master.wait_heartbeat()
     print("Connected to PX4 — sending LANDING_TARGET from camera")
     mav = master.mav
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    calib = np.load("camera_calibration.npz")
+    return master, mav
+
+def video_capture(config):
+    cap = cv2.VideoCapture(config["CAMERA_INDEX"])
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config["CAMERA_WIDTH"])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config["CAMERA_HEIGHT"])
+    return cap
+
+def calibration_parameters(config):
+    calib = np.load(config["CALIBRATION_PARAMS"])
     K, dist = calib["camera_matrix"], calib["dist_coeffs"]
+    return K, dist
+
+def aruco_detector(config):
+    aruco_dict_type = ARUCO_DICT[config["ARUCO_DICT_TYPE"]]
     detector = cv2.aruco.ArucoDetector(
-        cv2.aruco.getPredefinedDictionary(ARUCO_DICT["DICT_4X4_1000"]),
+        cv2.aruco.getPredefinedDictionary(aruco_dict_type),
         cv2.aruco.DetectorParameters(),
     )
-    print(f"Using ArUCo tag type: {aruco_dict_type}")
-    print(f"Using calibration parameters from: {calibration_params}")
-    print(f"Using side length: {side_length} meters")
-    print(f"Using camera matrix: {K}")
-    print(f"Using distortion coefficients: {dist}")
-    cache = {}
+    return detector
+
+def send_landing_target(mav, x_ned, y_ned, z_ned):
+    mav.landing_target_send(
+        int(time.time() * 1_000_000),
+        0,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        0.0, 0.0, 0.0, 0.0, 0.0,
+        x=x_ned, y=y_ned, z=z_ned,
+        q=[1.0, 0.0, 0.0, 0.0],
+        position_valid=1,
+    )
+
+
+
+def main_loop(config, master, mav, cache, cap, detector, K, dist, pos, att):
     while True:
         ok, frame = cap.read()
         if not ok:
             print("No camera frame")
             time.sleep(0.05)
             continue
-        tvec = estimate_marker(frame, detector, K, dist, side=0.1)
+        # estimate the marker position
+        tvec = estimate_marker(frame, detector, K, dist, side=config["SIDE_LENGTH"])
+        # if no marker is detected, sleep for 0.1 seconds and continue
+        if tvec is None:
+            print("No ArUco detection — not sending")
+            time.sleep(0.1)
+            continue
         pos = latest_message(master, "LOCAL_POSITION_NED", cache)
         att = latest_message(master, "ATTITUDE", cache)
-        # Optional PC debug: see the tag. Remove on the Pi / systemd.
-        cv2.imshow("pose", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        # if no marker is detected, sleep for 0.1 seconds and continue
         if tvec is None:
             print("No ArUco detection — not sending")
             time.sleep(0.1)
@@ -144,21 +134,22 @@ if __name__ == "__main__":
             print("PX4 pos/att not received yet — not sending")
             time.sleep(0.01)
             continue
+
+        # convert the marker position to body frame
         target_body = tuple(camera_to_frd(tvec))
+
+        # convert the marker position to NED frame
         dx, dy, dz = body_to_ned_offset(target_body, att.roll, att.pitch, att.yaw)
+
+        # get the target position in NED frame
         x_ned = pos.x + dx
         y_ned = pos.y + dy
         z_ned = pos.z + dz
-        mav.landing_target_send(
-            int(time.time() * 1_000_000),
-            0,
-            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0.0, 0.0, 0.0, 0.0, 0.0,
-            x=x_ned, y=y_ned, z=z_ned,
-            q=[1.0, 0.0, 0.0, 0.0],
-            # type=mavutil.mavlink.LANDING_TARGET_TYPE_VISION_FIDUCIAL,
-            position_valid=1,
-        )
+
+        # send the target position to the vehicle
+        send_landing_target(mav, x_ned, y_ned, z_ned)
+
+        # print the target position
         print(
             f"vehicle NED=({pos.x:.1f}, {pos.y:.1f}, {pos.z:.1f})  "
             f"cam tvec=({tvec[0,0]:.2f}, {tvec[1,0]:.2f}, {tvec[2,0]:.2f})  "
@@ -166,4 +157,35 @@ if __name__ == "__main__":
             f"sent pad NED=({x_ned:.1f}, {y_ned:.1f}, {z_ned:.1f})"
             f"print difference between detected and vehicle positon {pos.x - x_ned: .2f} {pos.y - y_ned: .2f} {pos.z - z_ned: .2f}"
         )
+
+        # sleep for 0.1 seconds
         time.sleep(0.1)
+
+def main():
+    # load configuration variables from config.yaml
+    config = load_config()
+
+    # connect to the mavlink
+    master, mav = mavlink_connection(config["MAVLINK_CONNECTION_STRING"])
+    cache = {}
+    
+    # get the latest message from the vehicle locacl position and attitude topic
+    pos = latest_message(master, "LOCAL_POSITION_NED", cache)
+    att = latest_message(master, "ATTITUDE", cache)
+
+    # set up the video capture
+    cap = video_capture(config)
+   
+    # load the calibration parameters
+    K, dist = calibration_parameters(config)
+
+    # set up the aruco detector
+    detector = aruco_detector(config)
+
+    # start the main loop
+    main_loop(config, master, mav, cache, cap, detector, K, dist, pos, att)
+
+
+if __name__ == "__main__":
+    main()
+
