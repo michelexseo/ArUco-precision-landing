@@ -17,16 +17,9 @@ R_CAM_TO_BODY = np.array([
     [ 0,  0, 1],  # z_frd =  z_cam
 ], dtype=float)
 
-
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
-
-def latest_message(master, msgtype, cache):
-    msg = master.recv_match(type=msgtype, blocking=False)
-    if msg is not None:
-        cache[msgtype] = msg
-    return cache.get(msgtype)
 
 def rotation_body_to_ned(roll, pitch, yaw):
     cr, sr = math.cos(roll), math.sin(roll)
@@ -47,14 +40,13 @@ def body_to_ned_offset(target_body, roll, pitch, yaw):
     z_n = R[2][0] * x_b + R[2][1] * y_b + R[2][2] * z_b
     return x_n, y_n, z_n
 
-    
 def camera_to_frd(tvec):
     return R_CAM_TO_BODY @ tvec.reshape(3)
 
-def estimate_marker(frame, detector, K, dist, side):
+def estimate_marker(frame, detector, K, dist, side, expected_marker_id):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
-    if ids is None:
+    if ids is None or ids[0] != expected_marker_id:
         return None
     marker_pts = np.array([
         [-side/2,  side/2, 0],
@@ -70,12 +62,36 @@ def estimate_marker(frame, detector, K, dist, side):
     return tvec if ok else None
 
 def mavlink_connection(mavlink_connection_string):
-    master = mavutil.mavlink_connection(mavlink_connection_string)
-    print("Waiting for heartbeat...")
+    # FIX 1: Set component ID so PX4 recognizes the companion computer
+    master = mavutil.mavlink_connection(
+        mavlink_connection_string,
+        source_system=255,
+        source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
+    )
+    
+    # FIX 2: Send initial heartbeat to wake up mavlink-router over UDP
+    print("Sending initial heartbeat to register with router...")
+    master.mav.heartbeat_send(
+        mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+        mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0
+    )
+
+    print("Waiting for heartbeat from PX4...")
     master.wait_heartbeat()
-    print("Connected to PX4 — sending LANDING_TARGET from camera")
-    mav = master.mav
-    return master, mav
+    print("Connected to PX4!")
+    
+    # FIX 3: Request the specific topics you need at 10 Hz
+    def request_message(msg_id, hz):
+        master.mav.command_long_send(
+            master.target_system, master.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+            msg_id, int(1e6 / hz), 0, 0, 0, 0, 0
+        )
+    print("Requesting ATTITUDE and LOCAL_POSITION_NED streams...")
+    request_message(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10)
+    request_message(mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 10)
+
+    return master, master.mav
 
 def video_capture(config):
     cap = cv2.VideoCapture(config["CAMERA_INDEX"])
@@ -107,59 +123,69 @@ def send_landing_target(mav, x_ned, y_ned, z_ned):
         position_valid=1,
     )
 
-
-
-def main_loop(config, master, mav, cache, cap, detector, K, dist, pos, att):
+def main_loop(config, master, mav, cache, cap, detector, K, dist):
+    last_hb = time.time()
+    
     while True:
+        now = time.time()
+        
+        # FIX 4: Send companion heartbeat at 1 Hz
+        if now - last_hb > 1.0:
+            mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0
+            )
+            last_hb = now
+
+        # FIX 5: Drain all pending MAVLink messages into the cache to avoid lag
+        while True:
+            msg = master.recv_match(type=['ATTITUDE', 'LOCAL_POSITION_NED'], blocking=False)
+            if not msg:
+                break
+            cache[msg.get_type()] = msg
+            
+        pos = cache.get("LOCAL_POSITION_NED")
+        att = cache.get("ATTITUDE")
+
+        # Read camera frame (this naturally blocks and dictates loop speed)
         ok, frame = cap.read()
         if not ok:
             print("No camera frame")
             time.sleep(0.05)
             continue
-        # estimate the marker position
-        tvec = estimate_marker(frame, detector, K, dist, side=config["SIDE_LENGTH"])
-        # if no marker is detected, sleep for 0.1 seconds and continue
+            
+        # Estimate the marker position
+        tvec = estimate_marker(frame, detector, K, dist, side=config["SIDE_LENGTH"], expected_marker_id=config["EXPECTED_MARKER_ID"]    )
+        
         if tvec is None:
-            print("No ArUco detection — not sending")
-            time.sleep(0.1)
+            print("No marker detected")
             continue
-        pos = latest_message(master, "LOCAL_POSITION_NED", cache)
-        att = latest_message(master, "ATTITUDE", cache)
-        # if no marker is detected, sleep for 0.1 seconds and continue
-        if tvec is None:
-            print("No ArUco detection — not sending")
-            time.sleep(0.1)
-            continue
+
         if pos is None or att is None:
             print("PX4 pos/att not received yet — not sending")
-            time.sleep(0.01)
             continue
 
-        # convert the marker position to body frame
+        # Convert the marker position to body frame
         target_body = tuple(camera_to_frd(tvec))
 
-        # convert the marker position to NED frame
+        # Convert the marker position to NED frame
         dx, dy, dz = body_to_ned_offset(target_body, att.roll, att.pitch, att.yaw)
 
-        # get the target position in NED frame
+        # Get the target position in NED frame
         x_ned = pos.x + dx
         y_ned = pos.y + dy
         z_ned = pos.z + dz
 
-        # send the target position to the vehicle
+        # Send the target position to the vehicle
         send_landing_target(mav, x_ned, y_ned, z_ned)
 
-        # print the target position
         print(
             f"vehicle NED=({pos.x:.1f}, {pos.y:.1f}, {pos.z:.1f})  "
             f"cam tvec=({tvec[0,0]:.2f}, {tvec[1,0]:.2f}, {tvec[2,0]:.2f})  "
             f"detected body=({target_body[0]:.2f}, {target_body[1]:.2f}, {target_body[2]:.2f})  "
-            f"sent pad NED=({x_ned:.1f}, {y_ned:.1f}, {z_ned:.1f})"
-            f"print difference between detected and vehicle positon {pos.x - x_ned: .2f} {pos.y - y_ned: .2f} {pos.z - z_ned: .2f}"
+            f"sent pad NED=({x_ned:.1f}, {y_ned:.1f}, {z_ned:.1f})  "
+            f"diff=({pos.x - x_ned:.2f}, {pos.y - y_ned:.2f}, {pos.z - z_ned:.2f})"
         )
-
-        # sleep for 0.1 seconds
-        time.sleep(0.1)
 
 def main():
     # load configuration variables from config.yaml
@@ -168,10 +194,6 @@ def main():
     # connect to the mavlink
     master, mav = mavlink_connection(config["MAVLINK_CONNECTION_STRING"])
     cache = {}
-    
-    # get the latest message from the vehicle locacl position and attitude topic
-    pos = latest_message(master, "LOCAL_POSITION_NED", cache)
-    att = latest_message(master, "ATTITUDE", cache)
 
     # set up the video capture
     cap = video_capture(config)
@@ -183,9 +205,8 @@ def main():
     detector = aruco_detector(config)
 
     # start the main loop
-    main_loop(config, master, mav, cache, cap, detector, K, dist, pos, att)
+    main_loop(config, master, mav, cache, cap, detector, K, dist)
 
 
 if __name__ == "__main__":
     main()
-
