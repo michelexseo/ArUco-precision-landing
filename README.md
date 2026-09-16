@@ -67,8 +67,7 @@ You should obtain something like this:
 - set up /etc/mavlink-router/main.conf
 - on a terminal run 
 ```bash
-sudo mavlink-
-routerd -c /etc/mavlink-router/main.conf 
+sudo mavlink-routerd -c /etc/mavlink-router/main.conf 
 ```
 
 - run 
