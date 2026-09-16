@@ -60,3 +60,19 @@ where:
 You should obtain something like this:
 ![Example of the output of the pose_estimation.py script](./pose_estimation1788951384.png)
 ![Example of the output of the pose_estimation.py script](./pose_estimation1788951391.png)
+
+
+## Runing on raspberry + OrangeCube
+
+- set up /etc/mavlink-router/main.conf
+- on a terminal run 
+```bash
+sudo mavlink-
+routerd -c /etc/mavlink-router/main.conf 
+```
+
+- run 
+```bash
+ source ~/drone/drone_env/bin/activate
+ python send_pose_estimation.py 
+ ```
