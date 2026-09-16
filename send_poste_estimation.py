@@ -4,11 +4,26 @@ os.environ["MAVLINK20"] = "1"
 import cv2
 import numpy as np
 from pymavlink import mavutil
-from utils import ARUCO_DICT
+from utils import ARUCO_DICT, FlightLogger
 import math
-import argparse
 import yaml
 from pathlib import Path
+import logging
+from datetime import datetime, timezone
+
+def setup_logging(log_dir="logs"):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(f"{log_dir}/run_{run_id}.log"),
+            logging.StreamHandler(),
+        ],
+    )
+    return run_id
+
 
 # Downward camera: OpenCV (x right, y down, z optical) -> FRD
 R_CAM_TO_BODY = np.array([
@@ -20,6 +35,19 @@ R_CAM_TO_BODY = np.array([
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
+def mavlink_message_types(config):
+    types = list(config.get("LOG_MAVLINK_MESSAGES") or [])
+    for required in ("ATTITUDE", "LOCAL_POSITION_NED"):
+        if required not in types:
+            types.append(required)
+    return types
+
+def heartbeat_fields(hb):
+    if hb is None:
+        return None, None
+    armed = bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+    return armed, hb.custom_mode
 
 def rotation_body_to_ned(roll, pitch, yaw):
     cr, sr = math.cos(roll), math.sin(roll)
@@ -54,7 +82,6 @@ def estimate_marker(frame, detector, K, dist, side, expected_marker_id):
         [ side/2, -side/2, 0],
         [-side/2, -side/2, 0],
     ], np.float32)
-    # pick first / expected ID
     ok, rvec, tvec = cv2.solvePnP(
         marker_pts, corners[0].reshape(4, 2).astype(np.float32),
         K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE,
@@ -62,32 +89,33 @@ def estimate_marker(frame, detector, K, dist, side, expected_marker_id):
     return tvec if ok else None
 
 def mavlink_connection(mavlink_connection_string):
-    # FIX 1: Set component ID so PX4 recognizes the companion computer
     master = mavutil.mavlink_connection(
         mavlink_connection_string,
         source_system=255,
-        source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
-    )
-    
-    # FIX 2: Send initial heartbeat to wake up mavlink-router over UDP
-    print("Sending initial heartbeat to register with router...")
-    master.mav.heartbeat_send(
-        mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
-        mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0
+        source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER,
     )
 
-    print("Waiting for heartbeat from PX4...")
+    logging.info("Sending initial heartbeat to register with router...")
+    master.mav.heartbeat_send(
+        mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+        mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0,
+    )
+
+    logging.info("Waiting for heartbeat from PX4...")
     master.wait_heartbeat()
-    print("Connected to PX4!")
-    
-    # FIX 3: Request the specific topics you need at 10 Hz
+    logging.info(
+        "Connected to PX4 (sys=%s comp=%s)",
+        master.target_system, master.target_component,
+    )
+
     def request_message(msg_id, hz):
         master.mav.command_long_send(
             master.target_system, master.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
-            msg_id, int(1e6 / hz), 0, 0, 0, 0, 0
+            msg_id, int(1e6 / hz), 0, 0, 0, 0, 0,
         )
-    print("Requesting ATTITUDE and LOCAL_POSITION_NED streams...")
+
+    logging.info("Requesting ATTITUDE and LOCAL_POSITION_NED at 10 Hz...")
     request_message(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10)
     request_message(mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 10)
 
@@ -123,89 +151,134 @@ def send_landing_target(mav, x_ned, y_ned, z_ned):
         position_valid=1,
     )
 
-def main_loop(config, master, mav, cache, cap, detector, K, dist):
-    last_hb = time.time()
+def should_log_frame(log_every_frame, detected, sent, skip_reason):
+    if log_every_frame:
+        return True
+    return detected or sent or skip_reason == "no_pos_att"
+
+def record_frame(logger, config, loop_start, **fields):
+    if not should_log_frame(
+        config.get("LOG_EVERY_FRAME", True),
+        fields.get("detected", False),
+        fields.get("sent", False),
+        fields.get("skip_reason", ""),
+    ):
+        return
+    loop_ms = (time.time() - loop_start) * 1000
+    logger.log_frame(loop_ms=loop_ms, **fields)
     
+
+def main_loop(config, master, mav, cache, cap, detector, K, dist, logger):
+    last_hb = time.time()
+    mavlink_types = mavlink_message_types(config)
+
     while True:
+        loop_start = time.time()
+
         now = time.time()
-        
-        # FIX 4: Send companion heartbeat at 1 Hz
         if now - last_hb > 1.0:
             mav.heartbeat_send(
                 mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0,
             )
             last_hb = now
 
-        # FIX 5: Drain all pending MAVLink messages into the cache to avoid lag
         while True:
-            msg = master.recv_match(type=['ATTITUDE', 'LOCAL_POSITION_NED'], blocking=False)
+            msg = master.recv_match(type=mavlink_types, blocking=False)
             if not msg:
                 break
             cache[msg.get_type()] = msg
-            
+
         pos = cache.get("LOCAL_POSITION_NED")
         att = cache.get("ATTITUDE")
+        hb = cache.get("HEARTBEAT")
+        armed, flight_mode = heartbeat_fields(hb)
 
-        # Read camera frame (this naturally blocks and dictates loop speed)
+        veh_ned = (pos.x, pos.y, pos.z) if pos is not None else None
+        attitude = (att.roll, att.pitch, att.yaw) if att is not None else None
+
         ok, frame = cap.read()
         if not ok:
-            print("No camera frame")
+            record_frame(
+                logger, config, loop_start,
+                veh_ned=veh_ned, attitude=attitude,
+                armed=armed, flight_mode=flight_mode,
+                skip_reason="no_frame",
+            )
             time.sleep(0.05)
             continue
-            
-        # Estimate the marker position
-        tvec = estimate_marker(frame, detector, K, dist, side=config["SIDE_LENGTH"], expected_marker_id=config["EXPECTED_MARKER_ID"]    )
-        
+
+        tvec = estimate_marker(
+            frame, detector, K, dist,
+            side=config["SIDE_LENGTH"],
+            expected_marker_id=config["EXPECTED_MARKER_ID"],
+        )
+
         if tvec is None:
-            print("No marker detected")
+            record_frame(
+                logger, config, loop_start,
+                veh_ned=veh_ned, attitude=attitude,
+                armed=armed, flight_mode=flight_mode,
+                skip_reason="no_marker",
+            )
             continue
 
         if pos is None or att is None:
-            print("PX4 pos/att not received yet — not sending")
+            record_frame(
+                logger, config, loop_start,
+                detected=True, tvec=tvec, frame=frame,
+                veh_ned=veh_ned, attitude=attitude,
+                armed=armed, flight_mode=flight_mode,
+                skip_reason="no_pos_att",
+            )
             continue
 
-        # Convert the marker position to body frame
         target_body = tuple(camera_to_frd(tvec))
-
-        # Convert the marker position to NED frame
         dx, dy, dz = body_to_ned_offset(target_body, att.roll, att.pitch, att.yaw)
-
-        # Get the target position in NED frame
         x_ned = pos.x + dx
         y_ned = pos.y + dy
         z_ned = pos.z + dz
+        diff_ned = (pos.x - x_ned, pos.y - y_ned, pos.z - z_ned)
 
-        # Send the target position to the vehicle
+        
         send_landing_target(mav, x_ned, y_ned, z_ned)
 
-        print(
-            f"vehicle NED=({pos.x:.1f}, {pos.y:.1f}, {pos.z:.1f})  "
-            f"cam tvec=({tvec[0,0]:.2f}, {tvec[1,0]:.2f}, {tvec[2,0]:.2f})  "
-            f"detected body=({target_body[0]:.2f}, {target_body[1]:.2f}, {target_body[2]:.2f})  "
-            f"sent pad NED=({x_ned:.1f}, {y_ned:.1f}, {z_ned:.1f})  "
-            f"diff=({pos.x - x_ned:.2f}, {pos.y - y_ned:.2f}, {pos.z - z_ned:.2f})"
+        record_frame(
+            logger, config, loop_start,
+            detected=True, tvec=tvec, target_body=target_body, frame=frame,
+            veh_ned=veh_ned, attitude=attitude,
+            armed=armed, flight_mode=flight_mode,
+            pad_ned=(x_ned, y_ned, z_ned),
+            diff_ned=diff_ned,
+            sent=True,
         )
 
 def main():
-    # load configuration variables from config.yaml
     config = load_config()
 
-    # connect to the mavlink
-    master, mav = mavlink_connection(config["MAVLINK_CONNECTION_STRING"])
-    cache = {}
+    log_dir = config.get("LOG_DIR", "logs")
+    summary_interval = config.get("LOG_SUMMARY_INTERVAL_SEC", 5)
+    run_id = setup_logging(log_dir)
+    logger = FlightLogger(
+        log_dir,
+        summary_interval,
+        run_id=run_id,
+        save_frames=config.get("LOG_SAVE_FRAMES", False),
+        frame_interval=config.get("LOG_FRAME_INTERVAL", 30),
+    )
+    logging.info("Starting precision landing (run_id=%s)", run_id)
 
-    # set up the video capture
-    cap = video_capture(config)
-   
-    # load the calibration parameters
-    K, dist = calibration_parameters(config)
-
-    # set up the aruco detector
-    detector = aruco_detector(config)
-
-    # start the main loop
-    main_loop(config, master, mav, cache, cap, detector, K, dist)
+    try:
+        master, mav = mavlink_connection(config["MAVLINK_CONNECTION_STRING"])
+        cache = {}
+        cap = video_capture(config)
+        K, dist = calibration_parameters(config)
+        detector = aruco_detector(config)
+        main_loop(config, master, mav, cache, cap, detector, K, dist, logger)
+    except KeyboardInterrupt:
+        logging.info("Stopped by user")
+    finally:
+        logger.close()
 
 
 if __name__ == "__main__":
