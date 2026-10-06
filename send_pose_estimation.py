@@ -10,6 +10,52 @@ import yaml
 from pathlib import Path
 import logging
 from datetime import datetime, timezone
+from gz.transport import Node as GzNode
+from gz.msgs.image_pb2 import Image as GzImage
+
+class GazeboCamera:
+    def __init__(self, topic: str, target_w: int = 640, target_h: int = 480):
+        self.latest_frame = None
+        self.target_w = target_w
+        self.target_h = target_h
+        self._first_frame_logged = False
+        
+        self.node = GzNode()
+        logging.info("Subscribing to Gazebo topic: %s", topic)
+        self.node.subscribe(GzImage, topic, self._cb)
+
+    def _cb(self, msg: GzImage):
+        try:
+            # Reconstruct RGB image from raw buffer
+            img = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
+            frame = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            h, w = frame.shape[:2]
+            if not self._first_frame_logged:
+                logging.info("First frame received from Gazebo! Native resolution: %dx%d (Target: %dx%d)", 
+                             w, h, self.target_w, self.target_h)
+                self._first_frame_logged = True
+
+            # Crop or resize to match calibration specifications
+            if w != self.target_w or h != self.target_h:
+                # Option A: Center crop if native is larger than calibration target
+                if w >= self.target_w and h >= self.target_h:
+                    x0 = (w - self.target_w) // 2
+                    y0 = (h - self.target_h) // 2
+                    frame = frame[y0:y0 + self.target_h, x0:x0 + self.target_w]
+                else:
+                    # Option B: Direct resize if native is smaller
+                    frame = cv2.resize(frame, (self.target_w, self.target_h), interpolation=cv2.INTER_LINEAR)
+
+            self.latest_frame = frame
+        except Exception as e:
+            logging.error("Error processing Gazebo image frame: %s", e)
+
+    def read(self):
+        if self.latest_frame is None:
+            return False, None
+        return True, self.latest_frame.copy()
+    
 
 def setup_logging(log_dir="logs"):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
@@ -122,10 +168,14 @@ def mavlink_connection(mavlink_connection_string):
     return master, master.mav
 
 def video_capture(config):
-    cap = cv2.VideoCapture(config["CAMERA_INDEX"])
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config["CAMERA_WIDTH"])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config["CAMERA_HEIGHT"])
-    return cap
+    topic = config.get(
+        "CAMERA_TOPIC",
+        "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/image"
+    )
+    width = config.get("CAMERA_WIDTH", 640)
+    height = config.get("CAMERA_HEIGHT", 480)
+    return GazeboCamera(topic, target_w=width, target_h=height)
+  
 
 def calibration_parameters(config):
     calib = np.load(config["CALIBRATION_PARAMS"])
@@ -171,6 +221,7 @@ def record_frame(logger, config, loop_start, **fields):
 def main_loop(config, master, mav, cache, cap, detector, K, dist, logger):
     last_hb = time.time()
     mavlink_types = mavlink_message_types(config)
+
 
     while True:
         loop_start = time.time()
