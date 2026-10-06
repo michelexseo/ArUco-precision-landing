@@ -75,3 +75,101 @@ sudo mavlink-routerd -c /etc/mavlink-router/main.conf
  source ~/drone/drone_env/bin/activate
  python send_pose_estimation.py 
  ```
+
+## Simulating the precision landing in Gazebo
+
+### Environment Setup and Dependencies
+
+Ensure that you have the following dependencies installed on your system: pymavlink, opencv, protobuf, pyyaml and numpy. You can install them using pip:
+
+```bash
+pip install pymavlink opencv-python pyyaml numpy protobuf
+```
+[For MacOS] Since we wamt to use Gazebo-transport binding to subscribe to the camera topic, we need to add the binding to the PYTHONPATH. The binding is located in the Gazebo installation directory. You can add the binding to the PYTHONPATH by running the following command:
+
+### Gazebo Python Transport & Bindings Setup (`gz-transport`)
+
+#### Why this is required
+The landing target script reads images directly from the Gazebo simulation engine using `gz.transport` and `gz.msgs.image_pb2`.
+
+Unlike standard Python libraries, **`gz-transport` cannot be installed via `pip install`** (PyPI does not host pre-compiled wheels for macOS or newer Gazebo versions). Instead, the bindings are compiled as native C++ shared libraries during the Homebrew installation of Gazebo / PX4 dependencies.
+
+Because Python virtual environments (`venv`) isolate themselves from system libraries by default, running `from gz.transport import Node` will result in `ModuleNotFoundError: No module named 'gz'`. We bridge this gap by adding a `.pth` path-configuration file directly inside the virtual environment.
+
+### Check Your Virtual Environment Python Version
+
+Check which minor version of Python your active virtual environment is using:
+
+```bash
+python --version
+```
+
+### Link the Homebrew Bindings to the Virtual Environment
+
+Create a `.pth` file inside your virtual environment's `site-packages` directory so Python automatically adds the Homebrew paths to `sys.path`.
+
+Run this command inside your activated `(venv)` (replace `python3.12` with your version from Step 3 if different):
+
+```bash
+python -c "import site; print(site.getsitepackages()[0])" | xargs -I {} sh -c '
+echo "/opt/homebrew/opt/gz-transport15/lib/python3.12/site-packages" > {}/gz_bindings.pth
+echo "/opt/homebrew/opt/gz-msgs12/lib/python3.12/site-packages" >> {}/gz_bindings.pth
+'
+```
+
+*Alternatively, create a file named gz_bindings.pth directly inside your venv/lib/pythonX.X/site-packages/ directory with these two lines:*
+
+```
+/opt/homebrew/opt/gz-transport15/lib/python3.12/site-packages
+/opt/homebrew/opt/gz-msgs12/lib/python3.12/site-packages
+```
+### Verify the Imports
+
+Confirm that Python can import the node transport client and the image protobuf definitions without errors:
+
+```bash
+# 1. Verify gz.transport node
+python -c "from gz.transport import Node; print('gz.transport loaded successfully!')"
+
+# 2. Verify gz.msgs image parser
+python -c "from gz.msgs.image_pb2 import Image as GzImage; print('gz.msgs loaded successfully!')"
+```
+
+### Network Routing Fix
+On macOS, gz-transport uses UDP multicast for node discovery. By default, macOS does not route multicast packets to the loopback interface (lo0), causing gz-transport to fail with No route to host and drop all image messages.
+
+Include this command under a macOS setup subsection:
+
+```bash
+sudo route add -net 224.0.0.0/4 -interface lo0
+```
+
+### Gazebo Simulation Environment
+
+To simulate the precision landing in Gazebo, we need to first set up the Gazebo environment and the drone model. The Gazebo environment should include a flat surface where the ArUco marker can be placed. The drone model should be equipped with a camera that can capture images of the environment. PX4 provides a Gazebo simulation environment that can be used for testing and development. The simulation environment can be set up by following the instructions provided in the PX4 documentation.
+
+```bash
+# Start the Gazebo simulation environment with the drone model, aruco marker and down facing camera
+make px4_sitl gz_x500_mono_cam_down_aruco
+```
+
+Once it starts, we need to subscribe to the camera topic. Inside the Gazebo simulation environment, select from the top right menu "Image Display". This should open a new window with the camera feed. In the "Image Display" window.
+
+![Selection of Image Display inside Gazebo](./imgs/gazebo_image_display.png)
+
+### Subscribing to the camera topic
+
+Then on a new terminal run the following command to subscribe to the camera topic and display the camera feed in a new window:
+
+```bash
+export GZ_IP=127.0.0.1  
+python send_pose_estimation.py 
+```
+
+### Configuraiton file and script changes
+Inside 'config.yaml' the following parameters were added in order to make the simulation work:
+```yaml
+CAMERA_TOPIC: "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/image"
+````
+
+This parameter is used inside the 'send_pose_estimation.py' script to subscribe to the camera topic and get the camera feed. The script was modified to use this parameter instead of the default camera topic. 
