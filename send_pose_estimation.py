@@ -121,11 +121,63 @@ def mavlink_connection(mavlink_connection_string):
 
     return master, master.mav
 
+def _v4l2_name(index):
+    try:
+        with open(f"/sys/class/video4linux/video{index}/name") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+def _try_open(index, width, height, attempts=8):
+    name = _v4l2_name(index).lower()
+    if any(token in name for token in ("metadata", "embedded")):
+        logging.info("Skipping camera index %s (%s)", index, name)
+        return None
+
+    cap = cv2.VideoCapture()
+    open_timeout = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+    read_timeout = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+    if open_timeout is not None:
+        cap.set(open_timeout, 2000)
+    if read_timeout is not None:
+        cap.set(read_timeout, 2000)
+    if not cap.open(index, cv2.CAP_V4L2):
+        cap.release()
+        return None
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    for _ in range(attempts):
+        ok, frame = cap.read()
+        if (
+            ok and frame is not None and frame.size
+            and frame.shape[1] >= width // 2
+            and frame.shape[0] >= height // 2
+        ):
+            logging.info(
+                "Camera index %s (%s) frame %s",
+                index, name or "unknown", frame.shape,
+            )
+            return cap
+        time.sleep(0.05)
+
+    logging.warning("Camera index %s opened but produced no usable frame", index)
+    cap.release()
+    return None
+
 def video_capture(config):
-    cap = cv2.VideoCapture(config["CAMERA_INDEX"])
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config["CAMERA_WIDTH"])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config["CAMERA_HEIGHT"])
-    return cap
+    preferred = int(config.get("CAMERA_INDEX", 0))
+    candidates = [preferred] + [i for i in (0, 1) if i != preferred]
+    width = config["CAMERA_WIDTH"]
+    height = config["CAMERA_HEIGHT"]
+    for index in candidates:
+        logging.info("Trying camera index %s", index)
+        cap = _try_open(index, width, height)
+        if cap is not None:
+            return cap, index
+    raise RuntimeError(f"No camera produced a frame (tried {candidates})")
 
 def calibration_parameters(config):
     calib = np.load(config["CALIBRATION_PARAMS"])
@@ -168,90 +220,103 @@ def record_frame(logger, config, loop_start, **fields):
     logger.log_frame(loop_ms=loop_ms, **fields)
     
 
-def main_loop(config, master, mav, cache, cap, detector, K, dist, logger):
+def main_loop(config, master, mav, cache, cap, camera_index, detector, K, dist, logger):
     last_hb = time.time()
+    fail_streak = 0
     mavlink_types = mavlink_message_types(config)
 
-    while True:
-        loop_start = time.time()
-
-        now = time.time()
-        if now - last_hb > 1.0:
-            mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0,
-            )
-            last_hb = now
-
+    try:
         while True:
-            msg = master.recv_match(type=mavlink_types, blocking=False)
-            if not msg:
-                break
-            cache[msg.get_type()] = msg
+            loop_start = time.time()
 
-        pos = cache.get("LOCAL_POSITION_NED")
-        att = cache.get("ATTITUDE")
-        hb = cache.get("HEARTBEAT")
-        armed, flight_mode = heartbeat_fields(hb)
+            now = time.time()
+            if now - last_hb > 1.0:
+                mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0,
+                )
+                last_hb = now
 
-        veh_ned = (pos.x, pos.y, pos.z) if pos is not None else None
-        attitude = (att.roll, att.pitch, att.yaw) if att is not None else None
+            while True:
+                msg = master.recv_match(type=mavlink_types, blocking=False)
+                if not msg:
+                    break
+                cache[msg.get_type()] = msg
 
-        ok, frame = cap.read()
-        if not ok:
+            pos = cache.get("LOCAL_POSITION_NED")
+            att = cache.get("ATTITUDE")
+            hb = cache.get("HEARTBEAT")
+            armed, flight_mode = heartbeat_fields(hb)
+
+            veh_ned = (pos.x, pos.y, pos.z) if pos is not None else None
+            attitude = (att.roll, att.pitch, att.yaw) if att is not None else None
+
+            ok, frame = cap.read()
+            frame_ok = ok and frame is not None and frame.size
+            if not frame_ok:
+                fail_streak += 1
+                if fail_streak >= 15:
+                    logging.warning(
+                        "Camera stalled on index %s, reopening", camera_index,
+                    )
+                    cap.release()
+                    cap, camera_index = video_capture(config)
+                    fail_streak = 0
+                record_frame(
+                    logger, config, loop_start,
+                    veh_ned=veh_ned, attitude=attitude,
+                    armed=armed, flight_mode=flight_mode,
+                    skip_reason="no_frame",
+                )
+                time.sleep(0.05)
+                continue
+            fail_streak = 0
+
+            tvec = estimate_marker(
+                frame, detector, K, dist,
+                side=config["SIDE_LENGTH"],
+                expected_marker_id=config["EXPECTED_MARKER_ID"],
+            )
+
+            if tvec is None:
+                record_frame(
+                    logger, config, loop_start,
+                    veh_ned=veh_ned, attitude=attitude,
+                    armed=armed, flight_mode=flight_mode,
+                    skip_reason="no_marker",
+                )
+                continue
+
+            if pos is None or att is None:
+                record_frame(
+                    logger, config, loop_start,
+                    detected=True, tvec=tvec, frame=frame,
+                    veh_ned=veh_ned, attitude=attitude,
+                    armed=armed, flight_mode=flight_mode,
+                    skip_reason="no_pos_att",
+                )
+                continue
+
+            target_body = tuple(camera_to_frd(tvec))
+            dx, dy, dz = body_to_ned_offset(target_body, att.roll, att.pitch, att.yaw)
+            x_ned = pos.x + dx
+            y_ned = pos.y + dy
+            z_ned = pos.z + dz
+            diff_ned = (pos.x - x_ned, pos.y - y_ned, pos.z - z_ned)
+
+            send_landing_target(mav, x_ned, y_ned, z_ned)
+
             record_frame(
                 logger, config, loop_start,
+                detected=True, tvec=tvec, target_body=target_body, frame=frame,
                 veh_ned=veh_ned, attitude=attitude,
                 armed=armed, flight_mode=flight_mode,
-                skip_reason="no_frame",
+                pad_ned=(x_ned, y_ned, z_ned),
+                diff_ned=diff_ned,
+                sent=True,
             )
-            time.sleep(0.05)
-            continue
-
-        tvec = estimate_marker(
-            frame, detector, K, dist,
-            side=config["SIDE_LENGTH"],
-            expected_marker_id=config["EXPECTED_MARKER_ID"],
-        )
-
-        if tvec is None:
-            record_frame(
-                logger, config, loop_start,
-                veh_ned=veh_ned, attitude=attitude,
-                armed=armed, flight_mode=flight_mode,
-                skip_reason="no_marker",
-            )
-            continue
-
-        if pos is None or att is None:
-            record_frame(
-                logger, config, loop_start,
-                detected=True, tvec=tvec, frame=frame,
-                veh_ned=veh_ned, attitude=attitude,
-                armed=armed, flight_mode=flight_mode,
-                skip_reason="no_pos_att",
-            )
-            continue
-
-        target_body = tuple(camera_to_frd(tvec))
-        dx, dy, dz = body_to_ned_offset(target_body, att.roll, att.pitch, att.yaw)
-        x_ned = pos.x + dx
-        y_ned = pos.y + dy
-        z_ned = pos.z + dz
-        diff_ned = (pos.x - x_ned, pos.y - y_ned, pos.z - z_ned)
-
-        
-        send_landing_target(mav, x_ned, y_ned, z_ned)
-
-        record_frame(
-            logger, config, loop_start,
-            detected=True, tvec=tvec, target_body=target_body, frame=frame,
-            veh_ned=veh_ned, attitude=attitude,
-            armed=armed, flight_mode=flight_mode,
-            pad_ned=(x_ned, y_ned, z_ned),
-            diff_ned=diff_ned,
-            sent=True,
-        )
+    finally:
+        cap.release()
 
 def main():
     config = load_config()
@@ -271,10 +336,12 @@ def main():
     try:
         master, mav = mavlink_connection(config["MAVLINK_CONNECTION_STRING"])
         cache = {}
-        cap = video_capture(config)
+        cap, camera_index = video_capture(config)
         K, dist = calibration_parameters(config)
         detector = aruco_detector(config)
-        main_loop(config, master, mav, cache, cap, detector, K, dist, logger)
+        main_loop(
+            config, master, mav, cache, cap, camera_index, detector, K, dist, logger,
+        )
     except KeyboardInterrupt:
         logging.info("Stopped by user")
     finally:
