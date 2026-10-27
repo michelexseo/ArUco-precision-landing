@@ -169,7 +169,7 @@ def _try_open(index, width, height, attempts=8):
 
 def video_capture(config):
     preferred = int(config.get("CAMERA_INDEX", 0))
-    candidates = [preferred] + [i for i in (0, 1) if i != preferred]
+    candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]
     width = config["CAMERA_WIDTH"]
     height = config["CAMERA_HEIGHT"]
     for index in candidates:
