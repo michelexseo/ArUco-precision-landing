@@ -64,6 +64,29 @@ You should obtain something like this:
 
 ## Running with MAVLink Router
 
+MAVLink Router can forward telemetry between the flight controller and the
+companion running this application. The application uses the camera to estimate
+the marker's position and sends it to PX4 in `LANDING_TARGET` MAVLink messages;
+it also receives vehicle position, attitude, and heartbeat messages from PX4.
+The router provides the communication link, but does not start a landing
+mission or configure PX4 to use precision-landing data. Configure the relevant
+PX4 precision-landing settings and mission or flight mode separately, following
+the documentation for your PX4 version.
+
+The basic setup is:
+
+1. Connect the flight controller to the companion running this application,
+   using a supported serial or network link.
+2. Configure MAVLink Router to receive MAVLink from the flight controller and
+   forward traffic to the application's UDP endpoint.
+3. Set `MAVLINK_CONNECTION_STRING` in `config.yaml` to match that endpoint,
+   then run `send_pose_estimation.py`.
+4. Verify that PX4 is receiving valid marker estimates and that its precision
+   landing configuration is correct before attempting a landing.
+
+Test the complete setup in a safe environment and follow the PX4 and vehicle
+manufacturer's safety procedures.
+
 Install MAVLink Router on the Linux system that will run the pose estimation
 script. On Debian- or Ubuntu-based systems, install the distribution package:
 
