@@ -62,16 +62,51 @@ You should obtain something like this:
 ![Example of the output of the pose_estimation.py script](./pose_estimation1788951391.png)
 
 
-## Runing on raspberry + OrangeCube
+## Running with MAVLink Router
 
-- set up /etc/mavlink-router/main.conf
-- on a terminal run 
+Install MAVLink Router on the Linux system that will run the pose estimation
+script. On Debian- or Ubuntu-based systems, install the distribution package:
+
 ```bash
-sudo mavlink-routerd -c /etc/mavlink-router/main.conf 
+sudo apt update
+sudo apt install mavlink-router
 ```
 
-- run 
+If the package is not available for your distribution, follow the installation
+instructions in the [MAVLink Router project](https://github.com/mavlink-router/mavlink-router).
+
+Configure the router using its system configuration file, usually
+`/etc/mavlink-router/main.conf`:
+
 ```bash
- source ~/drone/drone_env/bin/activate
- python send_pose_estimation.py 
- ```
+sudoedit /etc/mavlink-router/main.conf
+```
+
+Set up an input endpoint for the flight controller (for example, its serial
+device or UDP connection) and an output endpoint for this application. The
+output must match `MAVLINK_CONNECTION_STRING` in `config.yaml`; its default is
+`udpin:127.0.0.1:14540`. Adjust the application setting or router endpoint if
+your network setup uses a different address or port. Refer to the MAVLink
+Router documentation for endpoint options and configuration syntax.
+
+Start MAVLink Router. If your installation provides a systemd service, start
+it and check its status:
+
+```bash
+sudo systemctl enable --now mavlink-router
+sudo systemctl status mavlink-router
+```
+
+Otherwise, run the router directly using its system configuration:
+
+```bash
+sudo mavlink-routerd -c /etc/mavlink-router/main.conf
+```
+
+Once the router is running, activate the Python environment with the project
+dependencies and start pose estimation:
+
+```bash
+source ~/venv/bin/activate
+python send_pose_estimation.py
+```
