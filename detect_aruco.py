@@ -1,3 +1,5 @@
+"""Detect ArUco markers from a live camera feed."""
+
 import cv2
 import os
 import numpy as np
