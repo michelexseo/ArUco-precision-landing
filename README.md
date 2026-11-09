@@ -151,6 +151,10 @@ See each script's `--help` output for additional options. Benchmark results and
 runtime logs are written to `benchmark/` and `logs/`, respectively, and are
 excluded from version control.
 
+## Gazebo Simulation
+
+For Gazebo and PX4 simulation, use the [`gazebo` branch](https://github.com/michelexseo/ArUco-precision-landing/tree/gazebo), which includes a Gazebo-compatible version of `send_pose_estimation.py`. Switch to that branch and follow its README to set up and run the project with a working PX4 container and Gazebo.
+
 ## Logging
 
 For details on MAVLink runtime logs, CSV fields, and saved debug frames, see
